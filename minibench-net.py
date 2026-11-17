@@ -697,15 +697,15 @@ def installa_agente(args):
         print("test gia' fatto in passato: salto")
     else:
         time.sleep(30)                                     # il tempo di rendere «nostra» la chiave sul server
-        for giro_t in range(6):
+        for giro_t in range(30):                           # fino a un'ora: il tempo di rendere «nostra» la chiave
             r = subprocess.run([sys.executable, "-I", io, "--solo", "test"], capture_output=True, text=True,
                                env={**os.environ, "MINIBENCH_DIR": CARTELLA} if CARTELLA else None)
             righe = [l for l in (r.stdout + r.stderr).splitlines() if "test n." in l]
             print(righe[-1] if righe else (r.stdout + r.stderr)[-300:], flush=True)
             if righe and re.search(r"test n\.\d+: 20[01]", righe[-1]):
                 break
-            if giro_t < 5:
-                print("riprovo tra 2 minuti", flush=True); time.sleep(120)
+            if giro_t < 29:
+                print("riprovo tra 2 minuti (la chiave deve ancora essere resa «nostra»?)", flush=True); time.sleep(120)
         else:
             print("\nFERMO: il test non e' stato accettato. Riporta le righe qui sopra."); return 3
     passo(4, "demone in background")

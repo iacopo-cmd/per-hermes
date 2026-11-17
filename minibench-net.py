@@ -61,8 +61,8 @@ QUI = os.path.dirname(os.path.realpath(__file__))
 #   $MINIBENCH_DIR/config.env   $MINIBENCH_DIR/chiave   $MINIBENCH_DIR/stato/ (id_locale, sale, stato, storico)
 # Niente root e niente systemd: il demone si lancia in primo piano (--demone) da chi gestisce il container.
 CARTELLA = os.environ.get("MINIBENCH_DIR", "").strip()
-if not CARTELLA and "--installa-agente" in sys.argv and os.geteuid() != 0:
-    CARTELLA = os.path.join(QUI, "dati")                 # 0.14: agente senza root -> tutto nella cartella «dati» accanto al client
+if not CARTELLA and "--installa-agente" in sys.argv:
+    CARTELLA = os.path.join(QUI, "dati")                 # 0.14: agente (root o no) -> tutto nella cartella «dati» accanto al client
     os.environ["MINIBENCH_DIR"] = CARTELLA
 if CARTELLA:
     CARTELLA = os.path.abspath(os.path.expanduser(CARTELLA))

@@ -20,6 +20,11 @@ File:  /etc/minibench-net/config.env  (URL, nome, provider...)   /etc/minibench-
 Impronte (schema 2, 17/11/2026): HMAC-SHA256 con un SALE segreto della macchina (/var/lib/minibench-net/sale, 256 bit, 600)
 che NON esce mai dalla macchina: chi riceve l'impronta (anche il server) non puo' risalire al valore ne' confrontarlo con
 altre fonti. Si raccolgono solo valori casuali e non pubblici: id_locale, dmi_uuid, machine_id, disco_uuid.
+0.15 (19/11/2026, Iacopo: «il minibench deve scalare col tempo»; «meglio non scrivere file»; «viene da noi e noi gli diciamo
+ogni quanto ripassare»): l'orario lo da' il SERVER (/v1/target: torna_tra e seq; test CPU fitto il primo giorno, poi ogni
+3.547 s). Su disco NON si scrive piu' niente di continuo: stato solo in memoria, battito, storico di minibench.sh e lucchetto
+in RAM (/run/minibench-net, o /dev/shm); /var/lib/minibench-net/battito diventa un collegamento al battito in RAM (per il
+guardiano vecchio). Su disco restano solo id_locale, sale e chiave, scritti una volta.
 Uso:   minibench-net.py --demone        (il servizio: gira per sempre)
        minibench-net.py                 (un giro solo: i lavori scaduti)
        minibench-net.py --solo LAVORO   (quel lavoro adesso)   --prova LAVORO (stampa il JSON, non manda)
@@ -54,7 +59,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-VERSIONE = "0.14"
+VERSIONE = "0.15"
 CONF, CHIAVE, STATO_DIR = "/etc/minibench-net/config.env", "/etc/minibench-net/chiave", "/var/lib/minibench-net"
 QUI = os.path.dirname(os.path.realpath(__file__))
 # VERSIONE PER CONTAINER / SENZA ROOT (0.12, 17/11/2026): con MINIBENCH_DIR tutto sta in una cartella sola:
@@ -64,6 +69,13 @@ CARTELLA = os.environ.get("MINIBENCH_DIR", "").strip()
 if not CARTELLA and "--installa-agente" in sys.argv:
     CARTELLA = os.path.join(QUI, "dati")                 # 0.14: agente (root o no) -> tutto nella cartella «dati» accanto al client
     os.environ["MINIBENCH_DIR"] = CARTELLA
+# 0.15: quello che cambia di continuo sta in RAM, non sul disco
+if os.geteuid() == 0 and not CARTELLA and os.path.isdir("/run"):
+    RAM_DIR = "/run/minibench-net"
+elif os.path.isdir("/dev/shm"):
+    RAM_DIR = f"/dev/shm/minibench-net-{os.geteuid()}"
+else:
+    RAM_DIR = None                                     # niente RAM disponibile: si usa STATO_DIR come prima
 if CARTELLA:
     CARTELLA = os.path.abspath(os.path.expanduser(CARTELLA))
     CONF, CHIAVE, STATO_DIR = f"{CARTELLA}/config.env", f"{CARTELLA}/chiave", f"{CARTELLA}/stato"
@@ -111,16 +123,23 @@ def leggi_conf():
     return c
 
 
+_STATO = {}
+
+
 def stato(nuovo=None):
-    p = f"{STATO_DIR}/stato.json"
+    """0.15: lo stato (numeri di consegna, ora dell'ultimo lavoro, target) sta SOLO in memoria. Se la sonda riparte,
+    il server le ridice quando tornare e da che numero ripartire (/v1/target: torna_tra, seq)."""
+    global _STATO
     if nuovo is None:
-        try:
-            return json.load(open(p))
-        except (OSError, ValueError):
-            return {}
-    tmp = p + ".tmp"
-    json.dump(nuovo, open(tmp, "w"), indent=1)
-    os.replace(tmp, p)
+        return _STATO
+    _STATO = nuovo
+
+
+def ram(nome):
+    """Percorso di un file che cambia di continuo: in RAM se si puo', altrimenti nella cartella di stato."""
+    d = RAM_DIR or STATO_DIR
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return os.path.join(d, nome)
 
 
 # ---------------- 1. minibench ----------------
@@ -474,13 +493,25 @@ def ora_utc():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def leggi_conf_sicuro():
+    try:
+        return leggi_conf()
+    except OSError:
+        return {}
+
+
 def prendi_target(url, chiave, st, forza=False):
     """Target e intervalli dal server: si ricaricano ogni 10 minuti (se il server non risponde, tengo quelli vecchi)."""
     if forza or not st.get("target") or time.time() - st.get("target_preso", 0) > 600:
         cod, tg = chiama(f"{url}/v1/target", chiave)
         if cod == 200:
+            if not st.get("allineato") and isinstance(tg.get("torna_tra"), dict):   # 0.15: orario e numeri dal server
+                adesso, ogni = time.time(), intervalli(leggi_conf_sicuro(), tg)
+                for l in LAVORI:
+                    st["seq"][l] = max(st["seq"].get(l, 0), int((tg.get("seq") or {}).get(l, 0)))
+                    st["fatto"][l] = adesso + float(tg["torna_tra"].get(l, 0)) - ogni[l]
+                st["allineato"] = True
             st["target"], st["target_preso"] = tg, time.time()
-            stato(st)
         elif not st.get("target"):
             raise SystemExit(f"target: {cod} {tg}")
         else:
@@ -518,9 +549,16 @@ def giro(conf, url, chiave, st, solo=None, prova=None):
 
 
 def battito():
-    p = f"{STATO_DIR}/battito"
+    """Il battito per il guardiano (vivo.sh): in RAM; /var/lib/minibench-net/battito diventa un collegamento a quel file."""
+    p = ram("battito")
     open(p + ".tmp", "w").write(f"{time.time():.0f} {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n")
     os.replace(p + ".tmp", p)
+    vecchio = f"{STATO_DIR}/battito"
+    if RAM_DIR and not CARTELLA and os.path.realpath(vecchio) != os.path.realpath(p):
+        try:
+            os.symlink(p, vecchio + ".nuovo"); os.replace(vecchio + ".nuovo", vecchio)   # una volta sola
+        except OSError:
+            pass
 
 
 def verifica(args):
@@ -663,7 +701,7 @@ def chiedi_chiave(args):
 def demone_acceso():
     """Il demone tiene il lucchetto .giro.lock: se non si riesce a prenderlo, e' acceso."""
     try:
-        f = open(f"{STATO_DIR}/.giro.lock", "w")
+        f = open(ram(".giro.lock"), "w")
     except OSError:
         return False
     try:
@@ -691,9 +729,10 @@ def installa_agente(args):
     passo(2, "chiave (la chiede la sonda; noi approviamo)")
     if chiedi_chiave(["--aspetta"]) != 0:
         print("\nFERMO: chiave non ancora ritirata. Rilancia lo stesso comando piu' tardi."); return 2
-    st = stato()
+    conf = leggi_conf()
+    _, tg = chiama(conf.get("MINIBENCH_NET_URL", "").rstrip("/") + "/v1/target", open(CHIAVE).read().strip())
     passo(3, "primo test della CPU (qualche minuto)")
-    if st.get("fatto", {}).get("test"):
+    if int(((tg or {}).get("seq") or {}).get("test", 0)) > 0:
         print("test gia' fatto in passato: salto")
     else:
         time.sleep(30)                                     # il tempo di rendere «nostra» la chiave sul server
@@ -739,7 +778,7 @@ def main():
     if solo and solo not in LAVORI:
         raise SystemExit(f"lavori: {', '.join(LAVORI)}")
     os.makedirs(STATO_DIR, mode=0o700, exist_ok=True)
-    blocco = open(f"{STATO_DIR}/.giro.lock", "w")
+    blocco = open(ram(".giro.lock"), "w")
     try:
         fcntl.flock(blocco, fcntl.LOCK_EX | fcntl.LOCK_NB)        # una sola istanza
     except BlockingIOError:
@@ -806,7 +845,7 @@ def fai(lavoro, conf, url, chiave, st, tg, prova):
     elif lavoro == "test":
         time.sleep(6)                      # pausa: check e ping dello stesso giro non devono risultare come «macchina occupata»
         occ = occupata(3.0)
-        test = minibench(script_minibench(conf), f"{STATO_DIR}/minibench.csv")
+        test = minibench(script_minibench(conf), ram("minibench.csv"))
         imp, tempi, tot_us, esito = impronte(st.get("impronte"))
         pubblici = [p for p in conf.get("PUBBLICI", "").replace(" ", "").split(",") if p]
         dettagli = {k: v for k, v in {

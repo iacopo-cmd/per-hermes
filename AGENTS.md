@@ -9,8 +9,8 @@ Non serve configurare niente: `config.env.esempio` è già compilato per te. Non
 python3 -I minibench-net.py --installa-agente
 ```
 Fa da solo 5 passi e li stampa: [1/5] verifica, [2/5] chiave, [3/5] primo test della CPU, [4/5] demone in background, [5/5] rapporto.
-- Al passo 2 la sonda chiede la chiave al server e **aspetta da sola** che la approviamo (di solito 1-2 minuti, al massimo 3 ore).
-  Tu non devi chiedere niente a nessuno: aspetta che il comando vada avanti.
+- Al passo 2 la sonda **si iscrive da sola** (v2: si mette d'accordo col server sulle chiavi): non c'è niente da approvare
+  e tu non devi chiedere niente a nessuno. Se dice «iscrizione NON riuscita», riporta la riga esatta e fermati.
 - Il passo 3 dura qualche minuto e carica la CPU: è normale.
 - Tutto resta nella cartella `dati/` accanto al client (config, chiave, stato, `demone.log`).
 

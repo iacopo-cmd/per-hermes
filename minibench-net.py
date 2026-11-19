@@ -64,9 +64,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-VERSIONE = "0.16"
+VERSIONE = "0.17.1"
 CONF, CHIAVE, STATO_DIR = "/etc/minibench-net/config.env", "/etc/minibench-net/chiave", "/var/lib/minibench-net"
 QUI = os.path.dirname(os.path.realpath(__file__))
 # VERSIONE PER CONTAINER / SENZA ROOT (0.12, 17/11/2026): con MINIBENCH_DIR tutto sta in una cartella sola:
@@ -405,7 +405,115 @@ def sistema():
         acceso = int(float(open("/proc/uptime").read().split()[0]))
     except (OSError, ValueError):
         acceso = None
-    return {"rete": rete, "contenitori": contenitori, "processi": processi, "acceso_da_s": acceso}
+    out = {"rete": rete, "contenitori": contenitori, "processi": processi, "acceso_da_s": acceso}
+    agg = aggiornato_prima(acceso)
+    if agg is not None:
+        out["aggiornato_prima"] = agg
+    av = tempo_avvio(acceso)
+    if av is not None:
+        out["avvio_s"] = av
+    rj = riavvio_dal_journal(acceso)
+    if rj:
+        out["riavvio"] = rj
+        if rj.get("aggiornato") is not None:
+            out["aggiornato_prima"] = rj["aggiornato"]
+    if SPEGNIMENTO:
+        out["spegnimento"] = True
+    return out
+
+
+_RIAVVIO = {}
+
+
+def riavvio_dal_journal(acceso):
+    """0.17.1 (19/11/2026): dopo una ripartenza (prime 6 ore) legge dal JOURNAL di systemd l'ora esatta dello spegnimento (ultima riga
+    dell'avvio di prima) e della ripartenza, il kernel di prima e di adesso, e se un aggiornamento apt e' finito fra l'avvio di prima e lo
+    spegnimento. Piu' affidabile dell'avviso di spegnimento: funziona anche se allo spegnimento la rete era gia' giu'. Una volta per avvio."""
+    if acceso is None or acceso > 6 * 3600 or not shutil.which("journalctl"):
+        return None
+    if "fatto" in _RIAVVIO:
+        return _RIAVVIO["fatto"]
+    try:
+        avvii = json.loads(subprocess.run(["journalctl", "--list-boots", "--no-pager", "-o", "json"], capture_output=True, text=True, timeout=20).stdout or "[]")
+        prec = next(b for b in avvii if b.get("index") == -1)
+        ora = next(b for b in avvii if b.get("index") == 0)
+    except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired):
+        return None
+    a_us = lambda us: datetime.fromtimestamp(us / 1e6, timezone.utc)
+    spenta, partita, nata_prec = a_us(prec["last_entry"]), a_us(ora["first_entry"]), a_us(prec["first_entry"])
+    try:
+        riga = subprocess.run(["journalctl", "-b", "-1", "-k", "-o", "cat", "--no-pager", "-q", "-g", "^Linux version", "-n", "1"],
+                              capture_output=True, text=True, timeout=20).stdout
+        k_prima = (re.search(r"Linux version (\S+)", riga) or [None, None])[1]
+    except (OSError, subprocess.TimeoutExpired):
+        k_prima = None
+    k_ora = os.uname().release
+    agg = None
+    for f in ("/var/log/apt/history.log", "/var/log/apt/history.log.1"):
+        try:
+            for r in open(f, errors="replace"):
+                if r.startswith("End-Date:"):
+                    try:
+                        fine = datetime.strptime(" ".join(r.split()[1:3]), "%Y-%m-%d %H:%M:%S").astimezone(timezone.utc)
+                    except ValueError:
+                        continue
+                    agg = bool(agg) or (nata_prec <= fine <= spenta)
+        except OSError:
+            continue
+    if k_prima and k_prima != k_ora:
+        agg = True
+    _RIAVVIO["fatto"] = {"spenta": spenta.isoformat(timespec="seconds"), "partita": partita.isoformat(timespec="seconds"),
+                         "kernel_prima": k_prima, "kernel_ora": k_ora, "aggiornato": agg}
+    return _RIAVVIO["fatto"]
+
+
+SPEGNIMENTO = False                # 0.17: la macchina si sta spegnendo (systemd ferma la sonda): l'ultimo check lo dice al server
+_AVVIO = {}
+
+
+def tempo_avvio(acceso):
+    """0.17 (Iacopo: «prendiamo pure il tempo di boot e reboot»): quanto ci ha messo il sistema ad avviarsi (systemd-analyze: firmware,
+    loader, kernel, sistema). Solo nelle prime 6 ore dopo la ripartenza, una volta per avvio (in memoria)."""
+    if acceso is None or acceso > 6 * 3600 or not shutil.which("systemd-analyze"):
+        return None
+    chiave = int(time.time() - acceso) // 60
+    if chiave in _AVVIO:
+        return _AVVIO[chiave]
+    try:
+        out = subprocess.run(["systemd-analyze", "time"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"=\s*((?:\d+min\s*)?[\d.]+(?:ms|s))\s*$", out.splitlines()[0] if out else "")
+    if not m:
+        return None                                      # l'avvio non e' ancora finito: si riprova al check dopo
+    testo = m.group(1)
+    sec = (int(re.search(r"(\d+)min", testo).group(1)) * 60 if "min" in testo else 0)
+    v = re.search(r"([\d.]+)(ms|s)$", testo)
+    sec += float(v.group(1)) / (1000 if v.group(2) == "ms" else 1)
+    _AVVIO[chiave] = round(sec, 1)
+    return _AVVIO[chiave]
+
+
+def aggiornato_prima(acceso):
+    """0.17 (19/11/2026, Iacopo: «tocca segnare che quel reboot era un aggiornamento»): se la macchina e' ripartita da meno di 6 ore,
+    guarda nel registro di apt se un aggiornamento e' FINITO nelle 3 ore prima della ripartenza. None = non si sa (o accesa da tanto)."""
+    if acceso is None or acceso > 6 * 3600:
+        return None
+    avvio = datetime.fromtimestamp(time.time() - acceso)               # ora locale, come nel registro di apt
+    trovato = False
+    for f in ("/var/log/apt/history.log", "/var/log/apt/history.log.1"):
+        try:
+            for riga in open(f, errors="replace"):
+                if riga.startswith("End-Date:"):
+                    try:
+                        fine = datetime.strptime(" ".join(riga.split()[1:3]), "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    if avvio - timedelta(hours=3) <= fine <= avvio:
+                        trovato = True
+        except OSError:
+            continue
+    return trovato
 
 
 def occupata(secondi=2.0):
@@ -595,6 +703,8 @@ def iscrivi(args=()):
     campi = {"pub": base64.b64encode(pubblica(priv)).decode(), "nick": conf.get("NICK") or "anonimo",
              "nome": (conf.get("NOME_HOST") or socket.gethostname())[:64], "provider": (conf.get("PROVIDER") or "")[:64],
              "hosting": conf.get("TIPO_HOSTING") or "provider", "versione_client": VERSIONE}
+    if conf.get("CASA"):                       # 0.16.1: «chiave di casa» delle macchine nostre (mai nei repo pubblici)
+        campi["casa"] = conf["CASA"]
     req = urllib.request.Request(url + "/v2/iscrivi", json.dumps(campi).encode(), method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": f"minibench-net/{VERSIONE}"})
     try:
@@ -612,7 +722,8 @@ def iscrivi(args=()):
     _SEGRETO_V2.clear()
     scrivi_600(CHIAVE, chiave_accesso(segreto_v2()))
     print(f"ISCRITTA (v2), chiave n. {risp.get('chiave_id')}: chiave d'accesso ricavata e salvata in {CHIAVE} (600), mai mostrata.")
-    print("La macchina parte in quarantena: entra in classifica da sola dopo qualche giorno di dati coerenti.")
+    print("Macchina NOSTRA: niente quarantena." if risp.get("nostra") else
+          "La macchina parte in quarantena: entra in classifica da sola dopo qualche giorno di dati coerenti.")
     return 0
 
 
@@ -956,6 +1067,24 @@ def main():
         giro(conf, conf.get("MINIBENCH_NET_URL", "").rstrip("/"), open(CHIAVE).read().strip(), st, solo, prova)
         return
     log(f"demone minibench-net {VERSIONE} acceso")
+    import signal
+    def all_arresto(_sig, _frame):
+        """0.17: se si spegne la MACCHINA (non solo la sonda), un ultimo check al volo con «mi sto spegnendo» e l'ora esatta."""
+        global SPEGNIMENTO
+        try:
+            fermo = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=3).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            fermo = ""
+        if fermo == "stopping" and not CARTELLA:
+            SPEGNIMENTO = True
+            try:
+                c_ = leggi_conf()
+                fai("check", c_, c_.get("MINIBENCH_NET_URL", "").rstrip("/"), open(CHIAVE).read().strip(), st, st.get("target") or {}, None)
+                log("macchina in spegnimento: avvisato il server")
+            except Exception as e:
+                log(f"spegnimento: avviso non mandato ({type(e).__name__})")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, all_arresto)
     while True:
         conf = leggi_conf()                                      # config e chiave riletti a ogni giro: niente riavvii
         try:
